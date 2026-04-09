@@ -30,6 +30,8 @@ The extension depends on `@angular/language-service` and `typescript` Node packa
 ```
 
 Please ensure the versions of Angular and TypeScript are compatible to avoid issues.
+For monorepos, the extension tries to detect the project path by looking for a
+`package.json` that declares Angular dependencies.
 
 Refer to [Angular Version Compatibility](https://angular.dev/reference/versions#unsupported-angular-versions) for details. Mismatched versions may lead to bugs, so it is not recommended to use `latest` as a version, but it's also a valid option.
 
