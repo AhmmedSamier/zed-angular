@@ -31,6 +31,7 @@ struct AngularExtension {
     did_find_server: bool,
     angular_language_server_version: String,
     typescript_version: String,
+    project_path: Option<PathBuf>,
 }
 
 impl AngularExtension {
@@ -150,8 +151,73 @@ impl AngularExtension {
         env::current_dir().map_err(|e| format!("Failed to get current directory: {}", e))
     }
 
-    fn get_ng_probe_locations(worktree: Option<&zed::Worktree>) -> Vec<String> {
+    fn package_json_declares_angular(path: &PathBuf) -> bool {
+        let package_json = path.join("package.json");
+        let file = match fs::File::open(package_json) {
+            Ok(file) => file,
+            Err(_) => return false,
+        };
+
+        let package: serde_json::Value = match serde_json::from_reader(file) {
+            Ok(package) => package,
+            Err(_) => return false,
+        };
+
+        let sections = [
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+        ];
+
+        sections.iter().any(|section| {
+            package
+                .get(section)
+                .and_then(|dependencies| dependencies.as_object())
+                .is_some_and(|dependencies| {
+                    dependencies
+                        .keys()
+                        .any(|name| name == "@angular/core" || name.starts_with("@angular/"))
+                })
+        })
+    }
+
+    fn find_angular_project_path(&self, worktree: &zed::Worktree) -> Option<PathBuf> {
+        let mut candidates = vec![PathBuf::from(worktree.root_path())];
+        if let Ok(current_dir) = Self::get_current_dir() {
+            candidates.insert(0, current_dir);
+        }
+
+        for candidate in candidates {
+            for ancestor in candidate.ancestors() {
+                let ancestor_path = ancestor.to_path_buf();
+                if Self::package_json_declares_angular(&ancestor_path) {
+                    return Some(ancestor_path);
+                }
+            }
+        }
+
+        let worktree_root = PathBuf::from(worktree.root_path());
+        let entries = fs::read_dir(&worktree_root).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && Self::package_json_declares_angular(&path) {
+                return Some(path);
+            }
+        }
+
+        None
+    }
+
+    fn get_ng_probe_locations(
+        worktree: Option<&zed::Worktree>,
+        project_path: Option<&PathBuf>,
+    ) -> Vec<String> {
         let mut paths = vec![];
+
+        if let Some(project_path) = project_path {
+            paths.push(project_path.to_string_lossy().to_string());
+        }
 
         if let Ok(path) = Self::get_current_dir() {
             paths.push(path.to_string_lossy().to_string());
@@ -164,8 +230,15 @@ impl AngularExtension {
         paths
     }
 
-    fn get_ts_probe_locations(worktree: Option<&zed::Worktree>) -> Vec<String> {
+    fn get_ts_probe_locations(
+        worktree: Option<&zed::Worktree>,
+        project_path: Option<&PathBuf>,
+    ) -> Vec<String> {
         let mut paths = vec![];
+
+        if let Some(project_path) = project_path {
+            paths.push(project_path.to_string_lossy().to_string());
+        }
 
         if let Ok(path) = Self::get_current_dir() {
             paths.push(path.to_string_lossy().to_string());
@@ -185,6 +258,7 @@ impl zed::Extension for AngularExtension {
             did_find_server: false,
             angular_language_server_version: DEFAULT_ANGULAR_LANGUAGE_SERVER_VERSION.to_owned(),
             typescript_version: DEFAULT_TYPESCRIPT_VERSION.to_owned(),
+            project_path: None,
         }
     }
 
@@ -195,13 +269,15 @@ impl zed::Extension for AngularExtension {
     ) -> Result<zed::Command> {
         let user_settings = self.read_user_settings(language_server_id, worktree)?;
 
-        if let Some(version) = user_settings.angular_language_server_version {
-            self.angular_language_server_version = version;
+        if let Some(version) = user_settings.angular_language_server_version.as_ref() {
+            self.angular_language_server_version = version.clone();
         }
 
-        if let Some(version) = user_settings.typescript_version {
-            self.typescript_version = version;
+        if let Some(version) = user_settings.typescript_version.as_ref() {
+            self.typescript_version = version.clone();
         }
+
+        self.project_path = self.find_angular_project_path(worktree);
 
         let server_path = self.server_script_path(language_server_id)?;
         let current_dir = env::current_dir().unwrap_or(PathBuf::new());
@@ -211,13 +287,28 @@ impl zed::Extension for AngularExtension {
         args.push("--stdio".to_string());
 
         args.push("--tsProbeLocations".to_string());
-        args.extend(Self::get_ts_probe_locations(Some(worktree)));
+        args.extend(Self::get_ts_probe_locations(
+            Some(worktree),
+            self.project_path.as_ref(),
+        ));
 
         args.push("--ngProbeLocations".to_string());
-        args.extend(Self::get_ng_probe_locations(Some(worktree)));
+        args.extend(Self::get_ng_probe_locations(
+            Some(worktree),
+            self.project_path.as_ref(),
+        ));
 
         args.push("--tsdk".to_string());
-        args.push(TYPESCRIPT_TSDK_PATH.to_string());
+        if let Some(project_path) = &self.project_path {
+            args.push(
+                project_path
+                    .join(TYPESCRIPT_TSDK_PATH)
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        } else {
+            args.push(TYPESCRIPT_TSDK_PATH.to_string());
+        }
 
         Ok(zed::Command {
             command: zed::node_binary_path()?,
